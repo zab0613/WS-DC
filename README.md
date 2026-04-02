@@ -9,7 +9,7 @@ This repository is the official implementation of the paper:
 Digital task-oriented semantic communication (ToSC) aims to transmit only task-relevant information, significantly reducing communication overhead. Existing ToSC methods typically rely on learned codebooks to encode semantic features and map them to constellation symbols. However, these codebooks are often sparsely activated, resulting in low spectral efficiency and underutilization of channel capacity. This highlights a key challenge: how to design a codebook that not only supports task-specific inference but also approaches the theoretical limits of channel capacity. To address this challenge, we construct a spectral efficiency-aware codebook design framework that explicitly incorporates the codebook activation probability into the optimization process. Beyond maximizing task performance, we introduce the Wasserstein (WS) distance as a regularization metric to minimize the gap between the learned activation distribution and the optimal channel input distribution. Furthermore, we reinterpret WS theory from a generative perspective to align with the semantic nature of ToSC. Combining the above two aspects, we propose a WS-based adaptive hybrid distribution scheme, termed WS-DC, which learns compact, task-driven and channel-aware latent representations. Experimental results demonstrate that WS-DC not only outperforms existing approaches in inference accuracy but also significantly improves codebook efficiency, offering a promising direction toward capacity-approaching semantic communication systems.
 
 ## Training
-Firstly, train the UIS-ToSC framework.
+Firstly, train the WS-DC framework.
 ```
 python /run_VQVAE.py
 ----main_train()
