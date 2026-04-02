@@ -17,11 +17,11 @@ python /run_VQVAE.py
 Then, train the attacker stealing models.
 ```
 python /run_VQVAE.py
-----main_train_dec()
+----main_test()
 ```
 
 ## Simulation dataest
-CIFAR-10 dataest
+CIFAR-10 dataest/Tiny-Imagenet
 
 ## License
 This project is licensed under the license found in the LICENSE file in the root directory of this source tree.
