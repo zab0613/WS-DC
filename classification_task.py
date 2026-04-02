@@ -263,7 +263,9 @@ class VectorQuantizer(nn.Module):
             # # --- 总损失
             # loss = self.Lamda_WS * loss_WS + self.Lamda_GUASS * loss_AWGN
             # # ------------------------------------------------------------------------------------------------------方法一
-            codeword_weight = torch.ones(self.num_embeddings).to(inputs.device) / self.num_embeddings
+            # codeword_weight = torch.ones(self.num_embeddings).to(inputs.device) / self.num_embeddings
+            codeword_weight = torch.mean(min_encodings, dim=0)
+            codeword_weight = codeword_weight / (codeword_weight.sum() + 1e-12)
             uniform_target = torch.ones(self.num_embeddings, device=inputs.device) / self.num_embeddings
             gaussian_target = self.generate_awgn_gaussian(inputs.device)
             mixed_target = self.alpha * uniform_target + (1 - self.alpha) * gaussian_target
