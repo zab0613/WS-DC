@@ -142,14 +142,49 @@ class VectorQuantizer(nn.Module):
         self.num_embeddings = num_embeddings  # 16
         self.embedding_dim = embedding_dim     # 512
         self.commitment_cost = commitment_cost
-        self.alpha = 1
+        self.alpha = 0.5
+
+        self.epsilon = 0.05
+        self.dual_steps = 10
+        self.dual_lr = 0.5
+        self.hist_temperature = 0.5
+        self.ot_weight = 1.0
+        self.gaussian_mean = None
+        self.gaussian_std = None
 
         # self.codebook = nn.Parameter(torch.randn(self.num_embeddings, self.embedding_dim)) # 初始化为正态分布
         self.codebook = nn.Parameter(torch.empty(self.num_embeddings, self.embedding_dim).data.uniform_(-1 / self.num_embeddings, 1 / self.num_embeddings)) # 初始化为均匀分布
 
-        # self.codebook = nn.Embedding(self.num_embeddings, self.embedding_dim)  # 16X64
-        # self.codebook.weight.data.uniform_(-1 / self.num_embeddings, 1 / self.num_embeddings)
+    def _normalize_prob(self, p, eps=1e-12):
+        p = p.clamp_min(eps)
+        return p / p.sum()
 
+    def _dual_transport_objective(self, phi, src_w, tgt_w, cost):
+        src_w = self._normalize_prob(src_w)
+        tgt_w = self._normalize_prob(tgt_w)
+
+        log_tgt = torch.log(tgt_w.clamp_min(1e-12)).unsqueeze(0)
+        exp_term = (-cost + phi.unsqueeze(0)) / self.epsilon
+        logsumexp = torch.logsumexp(log_tgt + exp_term, dim=1)
+
+        obj = torch.sum(src_w * (-self.epsilon * logsumexp)) + torch.sum(tgt_w * phi)
+        return obj
+
+    def _dual_ot_loss(self, src_w, tgt_w, cost):
+        src_det = src_w.detach()
+        tgt_det = tgt_w.detach()
+        cost_det = cost.detach()
+
+        phi = torch.zeros_like(tgt_det, requires_grad=True)
+
+        for _ in range(self.dual_steps):
+            obj = self._dual_transport_objective(phi, src_det, tgt_det, cost_det)
+            grad_phi = torch.autograd.grad(obj, phi, create_graph=False)[0]
+            phi = (phi + self.dual_lr * grad_phi).detach().requires_grad_(True)
+
+        phi_star = phi.detach()
+        loss = self._dual_transport_objective(phi_star, src_w, tgt_w, cost)
+        return loss
 
     def mod_channel_demod(self, mod, x, device):
         """信道调制和解调"""
@@ -167,15 +202,17 @@ class VectorQuantizer(nn.Module):
 
     def recover(self, encodings):
         """通过编码还原数据"""
-        # out = torch.matmul(encodings, self.codebook.weight)
         out = torch.matmul(encodings, self.codebook)
         return out
 
-    def generate_awgn_gaussian(self, device):
-        indices = torch.arange(self.num_embeddings, device=device).float()
-        mean = self.num_embeddings / 2
-        # std = self.sigma_awgn
-        std = self.num_embeddings / 6  # 可以调整 std，控制目标分布宽度
+    def generate_awgn_gaussian(self, device, dtype):
+        indices = torch.arange(self.num_embeddings, device=device, dtype=dtype)
+        mean = self.gaussian_mean
+        if mean is None:
+            mean = (self.num_embeddings - 1) / 2
+        std = self.gaussian_std
+        if std is None:
+            std = self.num_embeddings / 6
         gaussian = torch.exp(-0.5 * ((indices - mean) / std) ** 2)
         return gaussian / gaussian.sum()
 
@@ -185,15 +222,9 @@ class VectorQuantizer(nn.Module):
         inputs_shape = inputs.shape
 
         flat_input = inputs.view(-1, self.embedding_dim).to(inputs.device)  # Flatten inputs for distance calculation
-
-        # 计算样本与码字之间的距离（L2距离）
-        # d = (torch.sum(flat_input ** 2, dim=1, keepdim=True)
-        #              + torch.sum(self.codebook.weight ** 2, dim=1)
-        #              - 2 * torch.matmul(flat_input, self.codebook.weight.t()))
         d = (torch.sum(flat_input ** 2, dim=1, keepdim=True)
                      + torch.sum(self.codebook ** 2, dim=1)
                      - 2 * torch.matmul(flat_input, self.codebook.t()))
-
         # 找到最近的编码
         min_encoding_indices = torch.argmin(d, dim=1).unsqueeze(1)
         min_encodings = torch.zeros(min_encoding_indices.shape[0], self.num_embeddings).to(inputs.device)
@@ -206,107 +237,63 @@ class VectorQuantizer(nn.Module):
         # quantized = PowerNormalize(quantized)
 
         if self.training:
-            # # ------------------------------------------------------------------------------------------------------
-            # size_batch = flat_input.shape[0]
-            # sample_weight = torch.ones(size_batch).to(inputs.device) / size_batch
-            # codeword_weight = torch.ones(self.num_embeddings).to(inputs.device) / self.num_embeddings
-            #
-            # centroids = torch.matmul(torch.diag(torch.ones(self.num_embeddings)).to(inputs.device), self.codebook.weight)
-            # loss_WS = ot.emd2(codeword_weight, sample_weight, d.t(), numItermax=500000)
-            #
-            # # --- 1. 获取当前平均码字使用概率（latent分布）
-            # avg_probs = torch.mean(min_encodings, dim=0) + 1e-6
-            # avg_probs = avg_probs / avg_probs.sum()
-            #
-            # # --- 2. 获取 AWGN 高斯目标分布
-            # gaussian_target = self.generate_awgn_gaussian(inputs.device)
-            #
-            # # --- 3. 计算 pairwise 欧氏距离 (1D, 所以等价于距离差绝对值)
-            # codebook_support = torch.arange(self.num_embeddings, device=inputs.device).float().view(-1, 1)
-            # distances_gauss = torch.cdist(codebook_support, codebook_support, p=2)  # shape [K, K]
-            #
-            # # --- 5. Wasserstein 距离（POT）
-            # loss_AWGN = ot.emd2(avg_probs, gaussian_target, distances_gauss, numItermax=50000)
-            # loss = self.Lamda_WS * loss_WS + self.Lamda_GUASS * loss_AWGN
-            # # ------------------------------------------------------------------------------------------------------
-            # # --- Sinkhorn 损失
-            # sinkhorn_loss = SamplesLoss("sinkhorn", p=2, blur=0.01)
-            # # --- Sinkhorn loss 1: 样本到码字 ---
-            # size_batch = flat_input.shape[0]
-            # alpha = torch.ones(self.num_embeddings, device=inputs.device) / self.num_embeddings
-            # beta = torch.ones(size_batch, device=inputs.device) / size_batch
-            #
-            # # 特征点
-            # x_support = self.codebook
-            # y_support = flat_input
-            # loss_WS = sinkhorn_loss(alpha, x_support, beta, y_support)
-            #
-            # # --- Sinkhorn loss 2: latent 分布约束为 Gaussian ---
-            # codebook_support = torch.linspace(0, 1, self.num_embeddings, device=inputs.device).unsqueeze(1)
-            # # codebook_support = torch.arange(self.num_embeddings, device=inputs.device).float().view(-1, 1)
-            #
-            # # --- Soft assignment for gradient flow ---
-            # temperature = 0.1  # 这个可调
-            # soft_assign = F.softmax(-d / temperature, dim=1)
-            # avg_probs = torch.mean(soft_assign, dim=0) + 1e-6
-            # avg_probs = avg_probs / avg_probs.sum()
-            # # 2. Ensure probs shape is [K, 1]
-            # avg_probs = avg_probs.unsqueeze(1)
-            #
-            # gaussian_target = self.generate_awgn_gaussian(inputs.device)
-            # gaussian_target = gaussian_target.unsqueeze(1)
-            #
-            # # 3. Stable Sinkhorn loss
-            # sinkhorn_lossAWGN = SamplesLoss("sinkhorn", p=2, blur=0.01)
-            # loss_AWGN = sinkhorn_lossAWGN(codebook_support, codebook_support, avg_probs, gaussian_target)
-            #
-            # # --- 总损失
-            # loss = self.Lamda_WS * loss_WS + self.Lamda_GUASS * loss_AWGN
-            # # ------------------------------------------------------------------------------------------------------方法一
-            # codeword_weight = torch.ones(self.num_embeddings).to(inputs.device) / self.num_embeddings
-            codeword_weight = torch.mean(min_encodings, dim=0)
-            codeword_weight = codeword_weight / (codeword_weight.sum() + 1e-12)
-            uniform_target = torch.ones(self.num_embeddings, device=inputs.device) / self.num_embeddings
-            gaussian_target = self.generate_awgn_gaussian(inputs.device)
-            mixed_target = self.alpha * uniform_target + (1 - self.alpha) * gaussian_target
-            mixed_target = mixed_target / mixed_target.sum()  # 保证和为 1
+            hard_hist = torch.mean(min_encodings, dim=0)
+            # 硬分配得到的码字激活频率
 
-            codeword_support = torch.arange(self.num_embeddings, device=inputs.device).float()  # 码字支持
-            distances = torch.cdist(codeword_support.view(-1, 1), codeword_support.view(-1, 1), p=2)  # 计算欧氏距离
+            soft_assign = F.softmax(-d / self.hist_temperature, dim=1)
+            # 基于距离的软分配概率
 
-            # 距离矩阵（这里假设你之前还是用 d.t() 作为 cost matrix）
-            loss = ot.emd2(codeword_weight, mixed_target, distances, numItermax=500000)
-            # # ------------------------------------------------------------------------------------------------------方法二
-            # --- 1. 计算当前激活概率（avg_probs）
-            # temperature = 0.1  # 这个可调
-            # soft_assign = F.softmax(-d / temperature, dim=1)  # 使用当前距离 d 计算 soft assignment
-            # avg_probs = torch.mean(soft_assign, dim=0) + 1e-6  # 计算每个码字的平均激活概率
-            # avg_probs = avg_probs / avg_probs.sum()  # 保证概率和为1
-            # avg_probs = avg_probs.unsqueeze(1)
-            #
-            # # --- 2. 生成目标分布
-            # uniform_target = torch.ones(self.num_embeddings, device=inputs.device) / self.num_embeddings
-            # gaussian_target = self.generate_awgn_gaussian(inputs.device)
-            # mixed_target = self.alpha * uniform_target + (1 - self.alpha) * gaussian_target
-            # mixed_target = mixed_target / mixed_target.sum()  # 保证目标和为1
-            # mixed_target = mixed_target.unsqueeze(1)  # 将目标分布也变为 [1, 256]
-            #
-            # # --- 3. 计算 Wasserstein 距离来优化激活概率
-            # loss = ot.emd2(avg_probs, mixed_target, d, numItermax=500000)
+            soft_hist = torch.mean(soft_assign, dim=0)
+            # 软分配得到的码字激活频率
 
-            print(f"emd_Loss: {loss.item():.4f}")
+            # codeword_weight = hard_hist + (soft_hist - soft_hist.detach())
+            # 前向看硬分布，反向走软分布梯度
+            codeword_weight = self._normalize_prob(soft_hist)
 
+            codeword_weight = self._normalize_prob(codeword_weight)
+            # 归一化成合法概率分布
+
+            uniform_target = torch.ones(
+                self.num_embeddings,
+                device=inputs.device,
+                dtype=inputs.dtype,
+            ) / self.num_embeddings
+            # 均匀目标分布
+
+            gaussian_target = self.generate_awgn_gaussian(inputs.device, inputs.dtype)
+            gaussian_target = self._normalize_prob(gaussian_target)
+            # 高斯目标分布
+
+            mixed_target = self.alpha * uniform_target + (1.0 - self.alpha) * gaussian_target
+            mixed_target = self._normalize_prob(mixed_target)
+            # 混合目标分布
+
+            codeword_support = torch.arange(
+                self.num_embeddings,
+                device=inputs.device,
+                dtype=inputs.dtype,
+            ).view(-1, 1)
+            # 码字索引 support
+
+            distances = torch.cdist(codeword_support, codeword_support, p=2)
+            # OT 代价矩阵
+
+            loss = self.ot_weight * self._dual_ot_loss(
+                codeword_weight, mixed_target, distances
+            )
+            # 当前码字分布 vs 混合目标分布 的半对偶 OT 损失
+
+            print(f"dual_ot_Loss: {loss.item():.4f}")
         else:
             loss = 0.0
-
+            
         quantized = quantized.view(inputs_shape)
         quantized = inputs + (quantized - inputs).detach()
         avg_probs = torch.mean(min_encodings, dim=0)
         perplexity = torch.exp(-torch.sum(avg_probs * torch.log(avg_probs + 1e-10)))
-
         quantized = quantized.permute(0, 3, 1, 2).contiguous()
 
-        return quantized, loss, perplexity
+        return quantized, loss, perplexity, min_encodings, min_encodings_noise
 
 class Classifier(nn.Module):
     def __init__(self, psnr):
